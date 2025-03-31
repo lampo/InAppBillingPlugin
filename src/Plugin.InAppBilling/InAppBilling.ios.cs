@@ -14,7 +14,9 @@ namespace Plugin.InAppBilling
 	/// </summary>
 	[Preserve(AllMembers = true)]
 	public class InAppBillingImplementation : BaseInAppBilling
-	{
+    {
+        bool shouldConsoleLog;
+        
         /// <summary>
         /// Backwards compat flag that may be removed in the future to auto finish all transactions like in v4
         /// </summary>
@@ -321,9 +323,10 @@ namespace Plugin.InAppBilling
         /// <param name="obfuscatedAccountId">Specifies an optional obfuscated string that is uniquely associated with the user's account in your app.</param>
         /// <param name="obfuscatedProfileId">Specifies an optional obfuscated string that is uniquely associated with the user's profile in your app.</param>
         /// <returns></returns>
-        public async override Task<InAppBillingPurchase> PurchaseAsync(string productId, ItemType itemType, string obfuscatedAccountId = null, string obfuscatedProfileId = null, string subOfferToken = null, CancellationToken cancellationToken = default)
+        public async override Task<InAppBillingPurchase> PurchaseAsync(string productId, ItemType itemType, string obfuscatedAccountId = null, string obfuscatedProfileId = null, string subOfferToken = null, bool enableConsoleLog = false, CancellationToken cancellationToken = default)
 		{
 			Init();
+            shouldConsoleLog = enableConsoleLog;
 			var p = await PurchaseAsync(productId, itemType, obfuscatedAccountId, cancellationToken);
 
 			var reference = new DateTime(2001, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc);
@@ -350,56 +353,84 @@ namespace Plugin.InAppBilling
 
 		async Task<SKPaymentTransaction> PurchaseAsync(string productId, ItemType itemType, string applicationUserName, CancellationToken cancellationToken)
 		{
+            if (shouldConsoleLog)
+            {
+                paymentObserver.TurnOnConsoleLog();
+            }
 			var tcsTransaction = new TaskCompletionSource<SKPaymentTransaction>();
 
 			var handler = new Action<SKPaymentTransaction, bool>((tran, success) =>
 			{
-				if (tran?.Payment == null)
+                ConsoleLog($"handler: Transaction | {tran.ToStatusString()}");
+
+                if (tran?.Payment == null)
 					return;
 
 				// Only handle results from this request
 				if (productId != tran.Payment.ProductIdentifier)
 					return;
 
+                ConsoleLog($"handler: success | {success}");
 				if (success)
 				{
 					tcsTransaction.TrySetResult(tran);
 					return;
 				}
 
+                ConsoleLog($"handler: tran.TransactionReceipt | {tran.TransactionReceipt?.GetBase64EncodedString(NSDataBase64EncodingOptions.None) ?? "empty"}");
+                
+                ConsoleLog($"handler: tran.Error.Code | {tran.Error?.Code}");
 				var errorCode = tran?.Error?.Code ?? -1;
+                ConsoleLog($"handler: errorCode | {errorCode}");
+
+                ConsoleLog($"handler: tran.Error.LocalizedDescription | {tran.Error?.LocalizedDescription}");
 				var description = tran?.Error?.LocalizedDescription ?? string.Empty;
+                ConsoleLog($"handler: description | {description}");
+                
 				var error = PurchaseError.GeneralError;
                 switch (errorCode)
                 {
                     case (int)SKError.PaymentCancelled:
                         error = PurchaseError.UserCancelled;
+                        ConsoleLog($"handler: switch SKError.PaymentCancelled | errorCode : {errorCode}, error : {error.ToString()}");
                         break;
                     case (int)SKError.PaymentInvalid:
                         error = PurchaseError.PaymentInvalid;
+                        ConsoleLog($"handler: switch SKError.PaymentInvalid | errorCode : {errorCode}, error : {error.ToString()}");
                         break;
                     case (int)SKError.PaymentNotAllowed:
                         error = PurchaseError.PaymentNotAllowed;
+                        ConsoleLog($"handler: switch SKError.PaymentNotAllowed | errorCode : {errorCode}, error : {error.ToString()}");
                         break;
                     case (int)SKError.ProductNotAvailable:
                         error = PurchaseError.ItemUnavailable;
+                        ConsoleLog($"handler: switch SKError.ProductNotAvailable | errorCode : {errorCode}, error : {error.ToString()}");
                         break;
                     case (int)SKError.Unknown:
                         try
                         {
+                            
+                            ConsoleLog($"handler: switch SKError.Unknown | errorCode : {errorCode}");
                             var underlyingError = tran?.Error?.UserInfo?["NSUnderlyingError"] as NSError;
+                            
+                            ConsoleLog($"handler: switch SKError.Unknown | underlyingError : {underlyingError}");
                             error = underlyingError?.Code == 3038 ? PurchaseError.AppleTermsConditionsChanged : PurchaseError.GeneralError;
+                            ConsoleLog($"handler: switch SKError.Unknown | error : {error.ToString()}");
                         }
                         catch
                         {
                             error = PurchaseError.GeneralError;
+                            ConsoleLog($"handler: switch SKError.Unknown catch | error : {error.ToString()}");
                         }
 						break;
 					case (int)SKError.ClientInvalid:
 						error = PurchaseError.BillingUnavailable;
+                        ConsoleLog($"handler: switch SKError.ClientInvalid | errorCode : {errorCode}, error : {error.ToString()}");
 						break;
 				}
 
+                ConsoleLog($"handler: error before InAppBillingPurchaseException is created | {error.ToString()}");
+                ConsoleLog($"handler: description before InAppBillingPurchaseException is created | {description}");
 				tcsTransaction.TrySetException(new InAppBillingPurchaseException(error, description));
 
 			});
@@ -407,6 +438,8 @@ namespace Plugin.InAppBilling
             try
             {
                 using var _ = cancellationToken.Register(() => tcsTransaction.TrySetCanceled());
+
+                ConsoleLog("Adding paymentObserver.TransactionCompleted handler");
                 paymentObserver.TransactionCompleted += handler;
 
 			    var products = await GetProductAsync(new[] { productId }, cancellationToken);
@@ -414,11 +447,13 @@ namespace Plugin.InAppBilling
 			    if (product == null)
 				    throw new InAppBillingPurchaseException(PurchaseError.InvalidProduct);
 
+                ConsoleLog($"applicationUserName | {applicationUserName}");
                 if (string.IsNullOrWhiteSpace(applicationUserName))
                 {
                     var payment = SKPayment.CreateFrom(product);
                     //var payment = SKPayment.CreateFrom((SKProduct)SKProduct.FromObject(new NSString(productId)));
 
+                    ConsoleLog("Calling SKPaymentQueue.DefaultQueue.AddPayment(payment) with SKPayment");
                     SKPaymentQueue.DefaultQueue.AddPayment(payment);
                 }
                 else
@@ -426,16 +461,27 @@ namespace Plugin.InAppBilling
                     var payment = SKMutablePayment.PaymentWithProduct(product);
                     payment.ApplicationUsername = applicationUserName;
 
+                    ConsoleLog("Calling SKPaymentQueue.DefaultQueue.AddPayment(payment) with SKMutablePayment");
                     SKPaymentQueue.DefaultQueue.AddPayment(payment);
                 }
 
+                ConsoleLog("await tcsTransaction.Task");
                 return await tcsTransaction.Task;
             }
             finally
             {
+                ConsoleLog("Removing paymentObserver.TransactionCompleted handler");
                 paymentObserver.TransactionCompleted -= handler;
             }
 		}
+        
+        void ConsoleLog(string logMessage)
+        {
+            if (shouldConsoleLog)
+            {
+                Console.WriteLine("RPLUS-74295 InAppBilling.InAppBillingImplementation.PurchaseAsync: " + logMessage);
+            }
+        }
 
         /// <summary>
         /// (iOS not supported) Apple store manages upgrades natively when subscriptions of the same group are purchased.
@@ -686,12 +732,16 @@ namespace Plugin.InAppBilling
         readonly Action<InAppBillingPurchase> onPurchaseFailure;
         readonly Func<SKPaymentQueue, SKPayment, SKProduct, bool> onShouldAddStorePayment;
 
+        bool shouldConsoleLog;
+
 		public PaymentObserver(Action<InAppBillingPurchase> onPurchaseSuccess, Action<InAppBillingPurchase> onPurchaseFailure, Func<SKPaymentQueue, SKPayment, SKProduct, bool> onShouldAddStorePayment)
 		{
 			this.onPurchaseSuccess = onPurchaseSuccess;
             this.onPurchaseFailure = onPurchaseFailure;
             this.onShouldAddStorePayment = onShouldAddStorePayment;
 		}
+        
+        public void TurnOnConsoleLog() => shouldConsoleLog = true;
 
         public override bool ShouldAddStorePayment(SKPaymentQueue queue, SKPayment payment, SKProduct product) =>
             onShouldAddStorePayment?.Invoke(queue, payment, product) ?? false;
@@ -706,12 +756,18 @@ namespace Plugin.InAppBilling
 			if (rt?.Any() ?? false)
 				restoredTransactions.AddRange(rt);
 
+            ConsoleLog($"Count of transactions: | {transactions.Length}");
+
 			foreach (var transaction in transactions)
 			{
 				if (transaction?.TransactionState == null)
 					break;
 
 				Debug.WriteLine($"Updated Transaction | {transaction.ToStatusString()}");
+
+                ConsoleLog($"Updated Transaction | {transaction.ToStatusString()}");
+                ConsoleLog($"transaction.TransactionState | {transaction.TransactionState.ToString()}");
+                ConsoleLog($"transaction.PurchaseState | {transaction.GetPurchaseState().ToString()}");
 
 				switch (transaction.TransactionState)
 				{
@@ -737,7 +793,15 @@ namespace Plugin.InAppBilling
 			}
 		}
 
-		public override void RestoreCompletedTransactionsFinished(SKPaymentQueue queue)
+        void ConsoleLog(string logMessage)
+        {
+            if (shouldConsoleLog)
+            {
+                Console.WriteLine("RPLUS-74295 InAppBilling.PaymentObserver.UpdatedTransactions: " + logMessage);
+            }
+        }
+
+        public override void RestoreCompletedTransactionsFinished(SKPaymentQueue queue)
 		{
 			if (restoredTransactions == null)
 				return;
